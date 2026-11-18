@@ -8,6 +8,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import {
@@ -23,6 +24,8 @@ import { UpdateTeamDto } from './dto/update-team.dto';
 import { AddMemberDto } from './dto/add-member.dto';
 import { RespondInvitationDto } from './dto/respond-invitation.dto';
 import { RespondRequestDto } from './dto/respond-request.dto';
+import { QueryTeamMembersDto } from './dto/query-team-members.dto';
+import { UpdateMemberRoleDto } from './dto/update-member-role.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../../common/guards/optional-jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -105,14 +108,34 @@ export class TeamsController {
   }
 
   /**
-   * 6. Get team details, active squad, invite URL, and requester's membership
+   * 6. Get paginated squad members filtered by status (ACTIVE, PENDING_PLAYER, PENDING_ADMIN)
+   */
+  @Get(':teamId/members')
+  @UseGuards(OptionalJwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary:
+      'Get paginated squad members filtered by status (ACTIVE, PENDING_PLAYER, PENDING_ADMIN)',
+  })
+  @ApiParam({ name: 'teamId', example: '672000000000000000000001' })
+  getTeamMembers(
+    @Param('teamId', ObjectIdValidationPipe) teamId: string,
+    @Query() query: QueryTeamMembersDto,
+    @CurrentUser('userId') requesterUserId?: string,
+  ) {
+    return this.teamsService.getTeamMembers(teamId, query, requesterUserId);
+  }
+
+  /**
+   * 7. Get team details, active squad, invite URL, and requester's membership
+   * Includes rosterCounts for Owner / Admin
    */
   @Get(':teamId')
   @UseGuards(OptionalJwtAuthGuard)
   @ApiBearerAuth('JWT-auth')
   @ApiOperation({
     summary:
-      'Get team profile, active squad, invite link, and viewer membership (Public / Optional Auth)',
+      'Get team profile, active squad, invite link, viewer membership, and rosterCounts (Public / Optional Auth)',
   })
   @ApiParam({ name: 'teamId', example: '672000000000000000000001' })
   getTeam(
@@ -123,7 +146,7 @@ export class TeamsController {
   }
 
   /**
-   * 7. Update team details and squad roles (Owner / Admin only)
+   * 8. Update team details and squad roles (Owner / Admin only)
    */
   @Patch(':teamId')
   @UseGuards(JwtAuthGuard)
@@ -142,7 +165,36 @@ export class TeamsController {
   }
 
   /**
-   * 8. Rotate / Regenerate team invite code (Owner / Admin only)
+   * 9. Update specific member role (Owner / Admin only)
+   */
+  @Patch(':teamId/members/:membershipId/role')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary: 'Update squad member role (Owner/Admin only, cannot assign OWNER)',
+  })
+  @ApiParam({ name: 'teamId', example: '672000000000000000000001' })
+  @ApiParam({
+    name: 'membershipId',
+    example: '672000000000000000000002',
+    description: 'Membership ID or User ID of target member',
+  })
+  updateMemberRole(
+    @Param('teamId', ObjectIdValidationPipe) teamId: string,
+    @Param('membershipId', ObjectIdValidationPipe) membershipId: string,
+    @CurrentUser('userId') requesterUserId: string,
+    @Body() dto: UpdateMemberRoleDto,
+  ) {
+    return this.teamsService.updateMemberRole(
+      teamId,
+      membershipId,
+      requesterUserId,
+      dto,
+    );
+  }
+
+  /**
+   * 10. Rotate / Regenerate team invite code (Owner / Admin only)
    */
   @Post(':teamId/invite-code/regenerate')
   @UseGuards(JwtAuthGuard)
@@ -159,7 +211,7 @@ export class TeamsController {
   }
 
   /**
-   * 9. Add or invite a member to the squad (Owner / Admin only)
+   * 11. Add or invite a member to the squad (Owner / Admin only)
    * Respects target user's allowDirectTeamAdd preference
    */
   @Post(':teamId/members')
@@ -179,7 +231,7 @@ export class TeamsController {
   }
 
   /**
-   * 10. List pending join requests (Owner / Admin only)
+   * 12. List pending join requests (Owner / Admin only)
    */
   @Get(':teamId/requests')
   @UseGuards(JwtAuthGuard)
@@ -196,7 +248,7 @@ export class TeamsController {
   }
 
   /**
-   * 11. Approve or Reject a join request (Owner / Admin only)
+   * 13. Approve or Reject a join request (Owner / Admin only)
    */
   @Patch(':teamId/requests/:membershipId')
   @UseGuards(JwtAuthGuard)
@@ -221,25 +273,31 @@ export class TeamsController {
   }
 
   /**
-   * 12. Remove member from squad or leave team (Owner/Admin or Self-leave)
+   * 14. Remove member, cancel invite, or leave team (Owner/Admin or Self)
+   * Supports resolving target by membershipId with fallback to userId.
    */
-  @Delete(':teamId/members/:userId')
+  @Delete(':teamId/members/:membershipId')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth('JWT-auth')
   @ApiOperation({
-    summary: 'Remove member or leave team (Owner/Admin or Self-leave)',
+    summary:
+      'Remove member, cancel invite, or leave team (Owner/Admin or Self)',
   })
   @ApiParam({ name: 'teamId', example: '672000000000000000000001' })
-  @ApiParam({ name: 'userId', example: '672000000000000000000004' })
+  @ApiParam({
+    name: 'membershipId',
+    example: '672000000000000000000002',
+    description: 'Membership ID or User ID of target member',
+  })
   removeMemberOrLeave(
     @Param('teamId', ObjectIdValidationPipe) teamId: string,
-    @Param('userId', ObjectIdValidationPipe) targetUserId: string,
+    @Param('membershipId', ObjectIdValidationPipe) membershipId: string,
     @CurrentUser('userId') requesterUserId: string,
   ) {
     return this.teamsService.removeMemberOrLeave(
       teamId,
-      targetUserId,
+      membershipId,
       requesterUserId,
     );
   }

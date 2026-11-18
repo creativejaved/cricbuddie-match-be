@@ -19,6 +19,7 @@ import {
 import { IdentityClientService } from '../identity-client/identity-client.service';
 import { InvitationAction } from './dto/respond-invitation.dto';
 import { RequestAction } from './dto/respond-request.dto';
+import { QueryRosterStatus } from './dto/query-team-members.dto';
 
 describe('TeamsService', () => {
   let service: TeamsService;
@@ -30,6 +31,7 @@ describe('TeamsService', () => {
   const ownerId = new Types.ObjectId('672000000000000000000001');
   const adminId = new Types.ObjectId('672000000000000000000002');
   const playerId = new Types.ObjectId('672000000000000000000003');
+  const player2Id = new Types.ObjectId('672000000000000000000004');
   const teamId = new Types.ObjectId('672000000000000000000010');
 
   const mockTeamDoc: any = {
@@ -65,6 +67,8 @@ describe('TeamsService', () => {
     mockTeamMemberModel.find = jest.fn();
     mockTeamMemberModel.findOne = jest.fn();
     mockTeamMemberModel.findById = jest.fn();
+    mockTeamMemberModel.findByIdAndDelete = jest.fn().mockResolvedValue(true);
+    mockTeamMemberModel.countDocuments = jest.fn().mockResolvedValue(0);
     mockTeamMemberModel.updateOne = jest.fn().mockResolvedValue(true);
     mockTeamMemberModel.updateMany = jest.fn().mockResolvedValue(true);
 
@@ -158,27 +162,27 @@ describe('TeamsService', () => {
   });
 
   describe('getTeamById', () => {
-    it('should return team details and active squad members', async () => {
+    it('should return team details and compute rosterCounts for OWNER/ADMIN', async () => {
       mockTeamModel.findOne = jest.fn().mockReturnValue({
         lean: jest.fn().mockResolvedValue({
           _id: teamId,
           name: 'Bangalore Blasters',
           shortName: 'BLR',
           inviteCode: 'BLR123',
+          ownerId,
+          adminIds: [ownerId, adminId],
           isActive: true,
         }),
       });
 
       mockTeamMemberModel.find = jest.fn().mockReturnValue({
-        lean: jest
-          .fn()
-          .mockResolvedValue([
-            {
-              _id: new Types.ObjectId(),
-              userId: ownerId,
-              squadRole: SquadRole.OWNER,
-            },
-          ]),
+        lean: jest.fn().mockResolvedValue([
+          {
+            _id: new Types.ObjectId(),
+            userId: ownerId,
+            squadRole: SquadRole.OWNER,
+          },
+        ]),
       });
 
       mockTeamMemberModel.findOne = jest.fn().mockReturnValue({
@@ -189,6 +193,12 @@ describe('TeamsService', () => {
         }),
       });
 
+      mockTeamMemberModel.countDocuments = jest
+        .fn()
+        .mockResolvedValueOnce(5) // active
+        .mockResolvedValueOnce(2) // pending invites
+        .mockResolvedValueOnce(3); // join requests
+
       const result = await service.getTeamById(
         teamId.toString(),
         ownerId.toString(),
@@ -197,6 +207,39 @@ describe('TeamsService', () => {
       expect(result.inviteUrl).toBe('http://localhost:5173/teams/join/BLR123');
       expect(result.members.length).toBe(1);
       expect(result.myMembership?.squadRole).toBe(SquadRole.OWNER);
+      expect(result.rosterCounts).toEqual({
+        active: 5,
+        pendingInvites: 2,
+        joinRequests: 3,
+      });
+    });
+
+    it('should omit rosterCounts for guests and non-admin viewers', async () => {
+      mockTeamModel.findOne = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue({
+          _id: teamId,
+          name: 'Bangalore Blasters',
+          shortName: 'BLR',
+          inviteCode: 'BLR123',
+          ownerId,
+          adminIds: [ownerId, adminId],
+          isActive: true,
+        }),
+      });
+
+      mockTeamMemberModel.find = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue([]),
+      });
+
+      mockTeamMemberModel.findOne = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue(null),
+      });
+
+      const result = await service.getTeamById(
+        teamId.toString(),
+        playerId.toString(), // regular player
+      );
+      expect(result.rosterCounts).toBeUndefined();
     });
 
     it('should throw NotFoundException if team does not exist', async () => {
@@ -207,6 +250,162 @@ describe('TeamsService', () => {
       await expect(service.getTeamById(teamId.toString())).rejects.toThrow(
         NotFoundException,
       );
+    });
+  });
+
+  describe('getTeamMembers', () => {
+    it('should return paginated ACTIVE squad members for any viewer', async () => {
+      mockTeamModel.findOne = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue(mockTeamDoc),
+      });
+
+      mockTeamMemberModel.find = jest.fn().mockReturnValue({
+        sort: jest.fn().mockReturnValue({
+          skip: jest.fn().mockReturnValue({
+            limit: jest.fn().mockReturnValue({
+              lean: jest.fn().mockResolvedValue([{ userId: playerId }]),
+            }),
+          }),
+        }),
+      });
+
+      mockTeamMemberModel.countDocuments = jest.fn().mockResolvedValue(1);
+
+      const result = await service.getTeamMembers(teamId.toString(), {
+        status: QueryRosterStatus.ACTIVE,
+        page: 1,
+        limit: 20,
+      });
+
+      expect(result.items.length).toBe(1);
+      expect(result.total).toBe(1);
+      expect(result.page).toBe(1);
+    });
+
+    it('should throw ForbiddenException when non-admin attempts to view PENDING_PLAYER', async () => {
+      mockTeamModel.findOne = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue(mockTeamDoc),
+      });
+
+      await expect(
+        service.getTeamMembers(
+          teamId.toString(),
+          { status: QueryRosterStatus.PENDING_PLAYER },
+          playerId.toString(), // not owner or admin
+        ),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('should allow OWNER to view PENDING_ADMIN requests', async () => {
+      mockTeamModel.findOne = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue(mockTeamDoc),
+      });
+
+      mockTeamMemberModel.find = jest.fn().mockReturnValue({
+        sort: jest.fn().mockReturnValue({
+          skip: jest.fn().mockReturnValue({
+            limit: jest.fn().mockReturnValue({
+              lean: jest.fn().mockResolvedValue([{ userId: playerId }]),
+            }),
+          }),
+        }),
+      });
+
+      mockTeamMemberModel.countDocuments = jest.fn().mockResolvedValue(1);
+
+      const result = await service.getTeamMembers(
+        teamId.toString(),
+        { status: QueryRosterStatus.PENDING_ADMIN },
+        ownerId.toString(),
+      );
+
+      expect(result.items.length).toBe(1);
+    });
+  });
+
+  describe('updateMemberRole', () => {
+    it('should reject assigning OWNER role with BadRequestException', async () => {
+      await expect(
+        service.updateMemberRole(
+          teamId.toString(),
+          playerId.toString(),
+          ownerId.toString(),
+          { squadRole: SquadRole.OWNER },
+        ),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should reject modifying the team OWNER', async () => {
+      mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
+      mockTeamMemberModel.findOne = jest.fn().mockResolvedValue({
+        _id: new Types.ObjectId(),
+        userId: ownerId,
+        squadRole: SquadRole.OWNER,
+        status: MembershipStatus.ACTIVE,
+      });
+
+      await expect(
+        service.updateMemberRole(
+          teamId.toString(),
+          ownerId.toString(),
+          ownerId.toString(),
+          { squadRole: SquadRole.ADMIN },
+        ),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should promote member to ADMIN and add to team.adminIds', async () => {
+      mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
+
+      const memberDoc = {
+        _id: new Types.ObjectId(),
+        userId: playerId,
+        squadRole: SquadRole.PLAYER,
+        status: MembershipStatus.ACTIVE,
+        save: jest.fn().mockResolvedValue(true),
+      };
+      mockTeamMemberModel.findOne = jest.fn().mockResolvedValue(memberDoc);
+
+      const result = await service.updateMemberRole(
+        teamId.toString(),
+        memberDoc._id.toString(),
+        ownerId.toString(),
+        { squadRole: SquadRole.ADMIN },
+      );
+
+      expect(result.squadRole).toBe(SquadRole.ADMIN);
+      expect(mockTeamModel.findByIdAndUpdate).toHaveBeenCalledWith(teamId, {
+        $addToSet: { adminIds: playerId },
+      });
+    });
+
+    it('should assign CAPTAIN, demoting existing CAPTAIN to PLAYER', async () => {
+      mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
+
+      const memberDoc = {
+        _id: new Types.ObjectId(),
+        userId: playerId,
+        squadRole: SquadRole.PLAYER,
+        status: MembershipStatus.ACTIVE,
+        save: jest.fn().mockResolvedValue(true),
+      };
+      mockTeamMemberModel.findOne = jest.fn().mockResolvedValue(memberDoc);
+
+      const result = await service.updateMemberRole(
+        teamId.toString(),
+        memberDoc._id.toString(),
+        ownerId.toString(),
+        { squadRole: SquadRole.CAPTAIN },
+      );
+
+      expect(result.squadRole).toBe(SquadRole.CAPTAIN);
+      expect(mockTeamMemberModel.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ squadRole: SquadRole.CAPTAIN }),
+        expect.objectContaining({ $set: { squadRole: SquadRole.PLAYER } }),
+      );
+      expect(mockTeamModel.findByIdAndUpdate).toHaveBeenCalledWith(teamId, {
+        $pull: { adminIds: playerId },
+      });
     });
   });
 
@@ -329,16 +528,38 @@ describe('TeamsService', () => {
       };
       mockTeamMemberModel.findById = jest.fn().mockResolvedValue(membershipDoc);
 
-      const result = await service.respondToInvitation(
+      const result = (await service.respondToInvitation(
         membershipDoc._id.toString(),
         playerId.toString(),
         { action: InvitationAction.ACCEPT },
-      );
+      )) as any;
 
       expect(result.status).toBe(MembershipStatus.ACTIVE);
       expect(mockTeamModel.findByIdAndUpdate).toHaveBeenCalledWith(teamId, {
         $inc: { activeMemberCount: 1 },
       });
+    });
+
+    it('should delete membership record when declined (REJECT)', async () => {
+      const membershipDoc = {
+        _id: new Types.ObjectId(),
+        teamId,
+        userId: playerId,
+        status: MembershipStatus.PENDING_PLAYER,
+      };
+      mockTeamMemberModel.findById = jest.fn().mockResolvedValue(membershipDoc);
+
+      const result = (await service.respondToInvitation(
+        membershipDoc._id.toString(),
+        playerId.toString(),
+        { action: InvitationAction.REJECT },
+      )) as any;
+
+      expect(result.message).toContain('declined');
+      expect(mockTeamMemberModel.findByIdAndDelete).toHaveBeenCalledWith(
+        membershipDoc._id,
+      );
+      expect(mockTeamModel.findByIdAndUpdate).not.toHaveBeenCalled();
     });
   });
 
@@ -443,17 +664,41 @@ describe('TeamsService', () => {
       };
       mockTeamMemberModel.findOne = jest.fn().mockResolvedValue(membershipDoc);
 
-      const result = await service.respondToJoinRequest(
+      const result = (await service.respondToJoinRequest(
         teamId.toString(),
         membershipDoc._id.toString(),
         ownerId.toString(),
         { action: RequestAction.APPROVE },
-      );
+      )) as any;
 
       expect(result.status).toBe(MembershipStatus.ACTIVE);
       expect(mockTeamModel.findByIdAndUpdate).toHaveBeenCalledWith(teamId, {
         $inc: { activeMemberCount: 1 },
       });
+    });
+
+    it('should delete join request on REJECT', async () => {
+      mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
+
+      const membershipDoc = {
+        _id: new Types.ObjectId(),
+        teamId,
+        status: MembershipStatus.PENDING_ADMIN,
+      };
+      mockTeamMemberModel.findOne = jest.fn().mockResolvedValue(membershipDoc);
+
+      const result = await service.respondToJoinRequest(
+        teamId.toString(),
+        membershipDoc._id.toString(),
+        ownerId.toString(),
+        { action: RequestAction.REJECT },
+      );
+
+      expect(result.message).toContain('rejected');
+      expect(mockTeamMemberModel.findByIdAndDelete).toHaveBeenCalledWith(
+        membershipDoc._id,
+      );
+      expect(mockTeamModel.findByIdAndUpdate).not.toHaveBeenCalled();
     });
   });
 
@@ -461,6 +706,7 @@ describe('TeamsService', () => {
     it('should prevent the team OWNER from leaving without transferring ownership', async () => {
       mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
       mockTeamMemberModel.findOne = jest.fn().mockResolvedValue({
+        _id: new Types.ObjectId(),
         userId: ownerId,
         squadRole: SquadRole.OWNER,
         status: MembershipStatus.ACTIVE,
@@ -478,6 +724,7 @@ describe('TeamsService', () => {
     it('should prevent an ADMIN from removing another ADMIN or OWNER', async () => {
       mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
       mockTeamMemberModel.findOne = jest.fn().mockResolvedValue({
+        _id: new Types.ObjectId(),
         userId: ownerId,
         squadRole: SquadRole.OWNER,
         status: MembershipStatus.ACTIVE,
@@ -492,14 +739,14 @@ describe('TeamsService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
-    it('should allow a PLAYER to leave and decrement member count', async () => {
+    it('should allow a PLAYER to leave, delete the record, and decrement member count', async () => {
       mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
 
       const playerMembership = {
+        _id: new Types.ObjectId(),
         userId: playerId,
         squadRole: SquadRole.PLAYER,
         status: MembershipStatus.ACTIVE,
-        save: jest.fn().mockResolvedValue(true),
       };
       mockTeamMemberModel.findOne = jest
         .fn()
@@ -507,13 +754,42 @@ describe('TeamsService', () => {
 
       const result = await service.removeMemberOrLeave(
         teamId.toString(),
-        playerId.toString(),
+        playerMembership._id.toString(),
         playerId.toString(),
       );
 
       expect(result.message).toContain('successfully left the team');
-      expect(playerMembership.status).toBe(MembershipStatus.REMOVED);
-      expect(mockTeamModel.findByIdAndUpdate).toHaveBeenCalled();
+      expect(mockTeamMemberModel.findByIdAndDelete).toHaveBeenCalledWith(
+        playerMembership._id,
+      );
+      expect(mockTeamModel.findByIdAndUpdate).toHaveBeenCalledWith(teamId, {
+        $set: { adminIds: [ownerId, adminId], activeMemberCount: 1 },
+      });
+    });
+
+    it('should allow canceling a PENDING_PLAYER invite without decrementing activeMemberCount', async () => {
+      mockTeamModel.findOne = jest.fn().mockResolvedValue(mockTeamDoc);
+
+      const pendingInvite = {
+        _id: new Types.ObjectId(),
+        userId: player2Id,
+        squadRole: SquadRole.PLAYER,
+        status: MembershipStatus.PENDING_PLAYER,
+      };
+      mockTeamMemberModel.findOne = jest.fn().mockResolvedValue(pendingInvite);
+
+      const result = await service.removeMemberOrLeave(
+        teamId.toString(),
+        pendingInvite._id.toString(),
+        ownerId.toString(),
+      );
+
+      expect(result.message).toContain('cancelled');
+      expect(mockTeamMemberModel.findByIdAndDelete).toHaveBeenCalledWith(
+        pendingInvite._id,
+      );
+      // activeMemberCount should NOT be decremented
+      expect(mockTeamModel.findByIdAndUpdate).not.toHaveBeenCalled();
     });
   });
 });

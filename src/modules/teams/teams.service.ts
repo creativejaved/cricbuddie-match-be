@@ -26,6 +26,11 @@ import {
   RespondInvitationDto,
 } from './dto/respond-invitation.dto';
 import { RequestAction, RespondRequestDto } from './dto/respond-request.dto';
+import {
+  QueryRosterStatus,
+  QueryTeamMembersDto,
+} from './dto/query-team-members.dto';
+import { UpdateMemberRoleDto } from './dto/update-member-role.dto';
 
 @Injectable()
 export class TeamsService {
@@ -83,7 +88,7 @@ export class TeamsService {
     isAdmin: boolean;
     isAuthorized: boolean;
   } {
-    const isOwner = team.ownerId.toString() === userId;
+    const isOwner = team.ownerId ? team.ownerId.toString() === userId : false;
     const isAdmin =
       team.adminIds?.some((adminId) => adminId.toString() === userId) || false;
     return {
@@ -91,6 +96,35 @@ export class TeamsService {
       isAdmin,
       isAuthorized: isOwner || isAdmin,
     };
+  }
+
+  /**
+   * Helper to find squad member by membership _id with fallback to userId
+   */
+  public async findMemberByIdentifier(
+    teamId: Types.ObjectId,
+    identifier: string,
+  ): Promise<TeamMemberDocument | null> {
+    if (!Types.ObjectId.isValid(identifier)) {
+      return null;
+    }
+    const objectId = new Types.ObjectId(identifier);
+
+    // 1. Try finding by membership _id
+    let member = await this.teamMemberModel.findOne({
+      _id: objectId,
+      teamId,
+    });
+
+    // 2. Fallback to userId
+    if (!member) {
+      member = await this.teamMemberModel.findOne({
+        userId: objectId,
+        teamId,
+      });
+    }
+
+    return member;
   }
 
   /**
@@ -209,6 +243,7 @@ export class TeamsService {
 
   /**
    * 3. Get team details, active squad, invite URL, and requester's membership
+   * If authenticated requester is OWNER or ADMIN, attaches live rosterCounts
    */
   async getTeamById(teamId: string, currentUserId?: string) {
     if (!Types.ObjectId.isValid(teamId)) {
@@ -231,6 +266,8 @@ export class TeamsService {
       .lean();
 
     let myMembership: Record<string, any> | null = null;
+    let isAuthorizedAdmin = false;
+
     if (currentUserId && Types.ObjectId.isValid(currentUserId)) {
       const foundMembership = await this.teamMemberModel
         .findOne({
@@ -247,17 +284,119 @@ export class TeamsService {
           joinedAt: foundMembership.joinedAt,
         };
       }
+
+      const { isAuthorized } = this.isOwnerOrAdmin(
+        team as unknown as TeamDocument,
+        currentUserId,
+      );
+      isAuthorizedAdmin = isAuthorized;
+    }
+
+    let rosterCounts:
+      | { active: number; pendingInvites: number; joinRequests: number }
+      | undefined;
+
+    if (isAuthorizedAdmin) {
+      const [activeCount, pendingInvitesCount, joinRequestsCount] =
+        await Promise.all([
+          this.teamMemberModel.countDocuments({
+            teamId: team._id,
+            status: MembershipStatus.ACTIVE,
+          }),
+          this.teamMemberModel.countDocuments({
+            teamId: team._id,
+            status: MembershipStatus.PENDING_PLAYER,
+          }),
+          this.teamMemberModel.countDocuments({
+            teamId: team._id,
+            status: MembershipStatus.PENDING_ADMIN,
+          }),
+        ]);
+
+      rosterCounts = {
+        active: activeCount,
+        pendingInvites: pendingInvitesCount,
+        joinRequests: joinRequestsCount,
+      };
     }
 
     return Object.assign({}, team, {
       inviteUrl: this.buildInviteUrl(team.inviteCode),
       members: activeMembers,
       myMembership,
+      rosterCounts,
     });
   }
 
   /**
-   * 4. Update team details and squad roles (Owner / Admin only)
+   * 4. Filtered squad roster with pagination
+   * Security guard: Viewing PENDING_PLAYER or PENDING_ADMIN requires Owner/Admin role
+   */
+  async getTeamMembers(
+    teamId: string,
+    query: QueryTeamMembersDto,
+    requesterUserId?: string,
+  ) {
+    if (!Types.ObjectId.isValid(teamId)) {
+      throw new BadRequestException('Invalid team ID format');
+    }
+
+    const team = await this.teamModel
+      .findOne({ _id: new Types.ObjectId(teamId), isActive: true })
+      .lean();
+
+    if (!team) {
+      throw new NotFoundException('Team not found');
+    }
+
+    const status = query.status || QueryRosterStatus.ACTIVE;
+    const page = query.page && query.page > 0 ? query.page : 1;
+    const limit = query.limit && query.limit > 0 ? query.limit : 20;
+
+    // Security check: PENDING_PLAYER and PENDING_ADMIN require Owner or Admin privileges
+    if (status !== QueryRosterStatus.ACTIVE) {
+      if (!requesterUserId) {
+        throw new ForbiddenException(
+          'Authentication required to view pending rosters',
+        );
+      }
+      const { isAuthorized } = this.isOwnerOrAdmin(
+        team as unknown as TeamDocument,
+        requesterUserId,
+      );
+      if (!isAuthorized) {
+        throw new ForbiddenException(
+          'Only team owner or administrators can view pending rosters',
+        );
+      }
+    }
+
+    const filter = {
+      teamId: team._id,
+      status: status as unknown as MembershipStatus,
+    };
+    const skip = (page - 1) * limit;
+
+    const [items, total] = await Promise.all([
+      this.teamMemberModel
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      this.teamMemberModel.countDocuments(filter),
+    ]);
+
+    return {
+      items,
+      total,
+      page,
+      limit,
+    };
+  }
+
+  /**
+   * 5. Update team details and squad roles (Owner / Admin only)
    */
   async updateTeam(teamId: string, userId: string, dto: UpdateTeamDto) {
     if (!Types.ObjectId.isValid(teamId)) {
@@ -412,7 +551,127 @@ export class TeamsService {
   }
 
   /**
-   * 5. Regenerate invite code (Owner / Admin only)
+   * 6. Update single member role (Owner / Admin only)
+   * Syncs Team.adminIds ($addToSet for ADMIN, $pull for others)
+   */
+  async updateMemberRole(
+    teamId: string,
+    membershipId: string,
+    requesterUserId: string,
+    dto: UpdateMemberRoleDto,
+  ) {
+    if (dto.squadRole === SquadRole.OWNER) {
+      throw new BadRequestException(
+        'Team ownership cannot be assigned through member role updates',
+      );
+    }
+
+    if (
+      !Types.ObjectId.isValid(teamId) ||
+      !Types.ObjectId.isValid(membershipId)
+    ) {
+      throw new BadRequestException('Invalid ID format');
+    }
+
+    const team = await this.teamModel.findOne({
+      _id: new Types.ObjectId(teamId),
+      isActive: true,
+    });
+
+    if (!team) {
+      throw new NotFoundException('Team not found');
+    }
+
+    const { isOwner, isAuthorized } = this.isOwnerOrAdmin(
+      team,
+      requesterUserId,
+    );
+    if (!isAuthorized) {
+      throw new ForbiddenException(
+        'Only team owner or administrators can update member roles',
+      );
+    }
+
+    const targetMember = await this.findMemberByIdentifier(
+      team._id,
+      membershipId,
+    );
+    if (!targetMember) {
+      throw new NotFoundException('Squad member not found');
+    }
+
+    if (targetMember.status !== MembershipStatus.ACTIVE) {
+      throw new BadRequestException(
+        'Role can only be updated for active squad members',
+      );
+    }
+
+    if (
+      targetMember.squadRole === SquadRole.OWNER ||
+      team.ownerId.equals(targetMember.userId)
+    ) {
+      throw new BadRequestException('Cannot modify the team owner role');
+    }
+
+    // Admin cannot modify other admins or promote to admin
+    if (!isOwner) {
+      if (targetMember.squadRole === SquadRole.ADMIN) {
+        throw new ForbiddenException(
+          'Administrators cannot modify roles of other administrators',
+        );
+      }
+      if (dto.squadRole === SquadRole.ADMIN) {
+        throw new ForbiddenException(
+          'Only the team owner can promote members to administrator',
+        );
+      }
+    }
+
+    // Demote existing Captain if new role is Captain
+    if (dto.squadRole === SquadRole.CAPTAIN) {
+      await this.teamMemberModel.updateMany(
+        {
+          teamId: team._id,
+          squadRole: SquadRole.CAPTAIN,
+          _id: { $ne: targetMember._id },
+          userId: { $ne: team.ownerId },
+        },
+        { $set: { squadRole: SquadRole.PLAYER } },
+      );
+    }
+
+    // Demote existing Vice-Captain if new role is Vice-Captain
+    if (dto.squadRole === SquadRole.VICE_CAPTAIN) {
+      await this.teamMemberModel.updateMany(
+        {
+          teamId: team._id,
+          squadRole: SquadRole.VICE_CAPTAIN,
+          _id: { $ne: targetMember._id },
+          userId: { $ne: team.ownerId },
+        },
+        { $set: { squadRole: SquadRole.PLAYER } },
+      );
+    }
+
+    targetMember.squadRole = dto.squadRole;
+    await targetMember.save();
+
+    // Sync team.adminIds
+    if (dto.squadRole === SquadRole.ADMIN) {
+      await this.teamModel.findByIdAndUpdate(team._id, {
+        $addToSet: { adminIds: targetMember.userId },
+      });
+    } else {
+      await this.teamModel.findByIdAndUpdate(team._id, {
+        $pull: { adminIds: targetMember.userId },
+      });
+    }
+
+    return targetMember;
+  }
+
+  /**
+   * 7. Regenerate invite code (Owner / Admin only)
    */
   async regenerateInviteCode(teamId: string, userId: string) {
     if (!Types.ObjectId.isValid(teamId)) {
@@ -446,7 +705,7 @@ export class TeamsService {
   }
 
   /**
-   * 6. Add member directly or invite (Owner / Admin only)
+   * 8. Add member directly or invite (Owner / Admin only)
    * Respects allowDirectTeamAdd preference from Identity Service
    */
   async addMember(teamId: string, requesterUserId: string, dto: AddMemberDto) {
@@ -558,7 +817,8 @@ export class TeamsService {
   }
 
   /**
-   * 7. Respond to pending invitation (Target Player only)
+   * 9. Respond to pending invitation (Target Player only)
+   * Deletes record on REJECT so player can be re-invited in future
    */
   async respondToInvitation(
     membershipId: string,
@@ -594,16 +854,19 @@ export class TeamsService {
       await this.teamModel.findByIdAndUpdate(membership.teamId, {
         $inc: { activeMemberCount: 1 },
       });
-    } else {
-      membership.status = MembershipStatus.REJECTED;
-      await membership.save();
-    }
 
-    return membership;
+      return membership;
+    } else {
+      // Delete record to free unique index { teamId: 1, userId: 1 }
+      await this.teamMemberModel.findByIdAndDelete(membership._id);
+      return {
+        message: 'Invitation declined successfully',
+      };
+    }
   }
 
   /**
-   * 8. Public Team Invite Preview for QR / URL landing page
+   * 10. Public Team Invite Preview for QR / URL landing page
    */
   async getInvitePreview(inviteCode: string) {
     const team = await this.teamModel
@@ -630,7 +893,7 @@ export class TeamsService {
   }
 
   /**
-   * 9. Join via Invite Code / QR (JWT Required)
+   * 11. Join via Invite Code / QR (JWT Required)
    */
   async joinViaInviteCode(inviteCode: string, userId: string) {
     const team = await this.teamModel.findOne({
@@ -735,7 +998,7 @@ export class TeamsService {
   }
 
   /**
-   * 10. List PENDING_ADMIN join requests (Owner / Admin only)
+   * 12. List PENDING_ADMIN join requests (Owner / Admin only)
    */
   async getJoinRequests(teamId: string, userId: string) {
     if (!Types.ObjectId.isValid(teamId)) {
@@ -767,7 +1030,8 @@ export class TeamsService {
   }
 
   /**
-   * 11. Approve or Reject a join request (Owner / Admin only)
+   * 13. Approve or Reject a join request (Owner / Admin only)
+   * Deletes record on REJECT so user can re-apply in future
    */
   async respondToJoinRequest(
     teamId: string,
@@ -821,26 +1085,30 @@ export class TeamsService {
       await this.teamModel.findByIdAndUpdate(team._id, {
         $inc: { activeMemberCount: 1 },
       });
-    } else {
-      membership.status = MembershipStatus.REJECTED;
-      await membership.save();
-    }
 
-    return membership;
+      return membership;
+    } else {
+      // Delete record to free unique index { teamId: 1, userId: 1 }
+      await this.teamMemberModel.findByIdAndDelete(membership._id);
+      return {
+        message: 'Join request rejected',
+      };
+    }
   }
 
   /**
-   * 12. Remove member or leave team
-   * Prevents Owner from leaving without transferring ownership
+   * 14. Remove member, cancel invite, or leave team
+   * Supports resolving target by membershipId with fallback to userId.
+   * Only decrements activeMemberCount if member was ACTIVE.
    */
   async removeMemberOrLeave(
     teamId: string,
-    targetUserId: string,
+    identifier: string,
     requesterUserId: string,
   ) {
     if (
       !Types.ObjectId.isValid(teamId) ||
-      !Types.ObjectId.isValid(targetUserId)
+      !Types.ObjectId.isValid(identifier)
     ) {
       throw new BadRequestException('Invalid ID format');
     }
@@ -854,31 +1122,25 @@ export class TeamsService {
       throw new NotFoundException('Team not found');
     }
 
-    const isSelf = targetUserId === requesterUserId;
+    const membership = await this.findMemberByIdentifier(team._id, identifier);
+
+    if (!membership) {
+      throw new NotFoundException('Squad member or invitation not found');
+    }
+
+    const isSelf = membership.userId.toString() === requesterUserId;
     const { isOwner: requesterIsOwner, isAdmin: requesterIsAdmin } =
       this.isOwnerOrAdmin(team, requesterUserId);
 
     if (!isSelf && !requesterIsOwner && !requesterIsAdmin) {
       throw new ForbiddenException(
-        'You do not have permission to remove members from this team',
+        'You do not have permission to remove members or cancel invitations for this team',
       );
     }
 
-    const targetObjectId = new Types.ObjectId(targetUserId);
-
-    const membership = await this.teamMemberModel.findOne({
-      teamId: team._id,
-      userId: targetObjectId,
-      status: MembershipStatus.ACTIVE,
-    });
-
-    if (!membership) {
-      throw new NotFoundException('Active squad member not found');
-    }
-
-    // Owner cannot leave without transferring ownership
+    // Owner cannot leave or be removed without transferring ownership
     if (
-      team.ownerId.equals(targetObjectId) ||
+      team.ownerId.equals(membership.userId) ||
       membership.squadRole === SquadRole.OWNER
     ) {
       throw new BadRequestException(
@@ -889,7 +1151,7 @@ export class TeamsService {
     // An admin cannot remove another admin or the owner
     if (!isSelf && !requesterIsOwner && requesterIsAdmin) {
       const targetIsAdmin =
-        team.adminIds.some((id) => id.equals(targetObjectId)) ||
+        team.adminIds.some((id) => id.equals(membership.userId)) ||
         membership.squadRole === SquadRole.ADMIN;
       if (targetIsAdmin) {
         throw new ForbiddenException(
@@ -898,24 +1160,37 @@ export class TeamsService {
       }
     }
 
-    // Set member status to REMOVED
-    membership.status = MembershipStatus.REMOVED;
-    await membership.save();
+    const wasActive = membership.status === MembershipStatus.ACTIVE;
+    const priorStatus = membership.status;
 
-    // Remove from team.adminIds if present
-    const updatedAdminIds = team.adminIds.filter(
-      (id) => !id.equals(targetObjectId),
-    );
-    const newCount = Math.max(1, team.activeMemberCount - 1);
+    // Delete record to free unique index { teamId: 1, userId: 1 }
+    await this.teamMemberModel.findByIdAndDelete(membership._id);
 
-    await this.teamModel.findByIdAndUpdate(team._id, {
-      $set: { adminIds: updatedAdminIds, activeMemberCount: newCount },
-    });
+    // Only decrement activeMemberCount and remove from adminIds if member was ACTIVE
+    if (wasActive) {
+      const updatedAdminIds = team.adminIds.filter(
+        (id) => !id.equals(membership.userId),
+      );
+      const newCount = Math.max(1, team.activeMemberCount - 1);
 
-    return {
-      message: isSelf
+      await this.teamModel.findByIdAndUpdate(team._id, {
+        $set: { adminIds: updatedAdminIds, activeMemberCount: newCount },
+      });
+    }
+
+    let message: string;
+    if (wasActive) {
+      message = isSelf
         ? 'You have successfully left the team'
-        : 'Member has been removed from the team',
-    };
+        : 'Member has been removed from the team';
+    } else if (priorStatus === MembershipStatus.PENDING_PLAYER) {
+      message = isSelf
+        ? 'Invitation declined'
+        : 'Outbound invitation cancelled';
+    } else {
+      message = isSelf ? 'Join request withdrawn' : 'Join request rejected';
+    }
+
+    return { message };
   }
 }

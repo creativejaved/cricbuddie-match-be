@@ -5,6 +5,8 @@ import { PassportModule } from '@nestjs/passport';
 import { JwtStrategy } from './common/strategies/jwt.strategy';
 import { IdentityClientModule } from './modules/identity-client/identity-client.module';
 import { TeamsModule } from './modules/teams/teams.module';
+import { MatchesModule } from './modules/matches/matches.module';
+import { ScoringModule } from './modules/scoring/scoring.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
@@ -25,6 +27,8 @@ import { AppService } from './app.service';
     PassportModule.register({ defaultStrategy: 'jwt' }),
     IdentityClientModule,
     TeamsModule,
+    MatchesModule,
+    ScoringModule,
   ],
   controllers: [AppController],
   providers: [AppService, JwtStrategy],

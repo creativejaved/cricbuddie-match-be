@@ -93,3 +93,6 @@ TeamMemberSchema.index({ teamId: 1, userId: 1 }, { unique: true });
 
 // Secondary index for user's active/pending teams query
 TeamMemberSchema.index({ userId: 1, status: 1 });
+
+// Compound index for fast filtered roster queries by status ordered by creation date
+TeamMemberSchema.index({ teamId: 1, status: 1, createdAt: -1 });
