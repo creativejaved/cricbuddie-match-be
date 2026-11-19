@@ -53,6 +53,14 @@ export class QueryMatchesDto {
 
   @ApiPropertyOptional({
     description:
+      'Filter matches related to a specific User ID (creator, scorer, umpire, or playing XI)',
+  })
+  @IsOptional()
+  @IsMongoId()
+  userId?: string;
+
+  @ApiPropertyOptional({
+    description:
       'Filter matches related to authenticated user (creator, scorer, or playing XI)',
     default: false,
   })

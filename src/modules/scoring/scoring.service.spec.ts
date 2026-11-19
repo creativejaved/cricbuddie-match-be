@@ -2,7 +2,7 @@ import { jest } from '@jest/globals';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getModelToken } from '@nestjs/mongoose';
 import { Types } from 'mongoose';
-import { ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ScoringService } from './scoring.service';
 import { Match, MatchStatus } from '../../schemas/match.schema';
 import { Inning } from '../../schemas/inning.schema';
@@ -23,60 +23,76 @@ describe('ScoringService', () => {
   const batter2Id = new Types.ObjectId('672000000000000000000102');
   const bowler1Id = new Types.ObjectId('672000000000000000000201');
 
-  const mockMatchDoc: any = {
-    _id: matchId,
-    status: MatchStatus.LIVE,
-    createdBy: scorerId,
-    currentInningsNumber: 1,
-    lastSyncedSequence: 0,
-    teamA: {
-      teamId: teamAId,
-      name: 'Royal Strikers',
-      shortName: 'RS',
-      playingXI: [
-        { userId: batter1Id, fullName: 'Virat Kohli' },
-        { userId: batter2Id, fullName: 'AB de Villiers' },
-      ],
-      runs: 0,
-      wickets: 0,
-      oversText: '0.0',
-    },
-    teamB: {
-      teamId: teamBId,
-      name: 'Chennai Kings',
-      shortName: 'CK',
-      playingXI: [{ userId: bowler1Id, fullName: 'Jasprit Bumrah' }],
-      runs: 0,
-      wickets: 0,
-      oversText: '0.0',
-    },
-    officials: {
-      scorerIds: [scorerId],
-      scorerId,
-      activeScorerId: scorerId,
-    },
-    markModified: jest.fn(),
-    save: jest.fn().mockResolvedValue(true),
-  };
-
-  const mockInningDoc: any = {
-    _id: new Types.ObjectId(),
-    matchId,
-    inningsNumber: 1,
-    battingTeamId: teamAId,
-    bowlingTeamId: teamBId,
-    totalRuns: 0,
-    totalWickets: 0,
-    legalBallsBowled: 0,
-    extras: { wides: 0, noBalls: 0, byes: 0, legByes: 0, penalty: 0 },
-    currentState: {},
-    battingCard: [],
-    bowlingCard: [],
-    fallOfWickets: [],
-    save: jest.fn().mockResolvedValue(true),
-  };
+  let mockMatchDoc: any;
+  let mockInningDoc: any;
 
   beforeEach(async () => {
+    mockMatchDoc = {
+      _id: matchId,
+      status: MatchStatus.LIVE,
+      createdBy: scorerId,
+      currentInningsNumber: 1,
+      oversPerInnings: 20,
+      ballsPerOver: 6,
+      lastSyncedSequence: 0,
+      teamA: {
+        teamId: teamAId,
+        name: 'Royal Strikers',
+        shortName: 'RS',
+        playingXI: [
+          { userId: batter1Id, fullName: 'Virat Kohli' },
+          { userId: batter2Id, fullName: 'AB de Villiers' },
+          { userId: new Types.ObjectId(), fullName: 'Player 3' },
+          { userId: new Types.ObjectId(), fullName: 'Player 4' },
+          { userId: new Types.ObjectId(), fullName: 'Player 5' },
+          { userId: new Types.ObjectId(), fullName: 'Player 6' },
+          { userId: new Types.ObjectId(), fullName: 'Player 7' },
+          { userId: new Types.ObjectId(), fullName: 'Player 8' },
+          { userId: new Types.ObjectId(), fullName: 'Player 9' },
+          { userId: new Types.ObjectId(), fullName: 'Player 10' },
+          { userId: new Types.ObjectId(), fullName: 'Player 11' },
+        ],
+        runs: 0,
+        wickets: 0,
+        oversText: '0.0',
+      },
+      teamB: {
+        teamId: teamBId,
+        name: 'Chennai Kings',
+        shortName: 'CK',
+        playingXI: [{ userId: bowler1Id, fullName: 'Jasprit Bumrah' }],
+        runs: 0,
+        wickets: 0,
+        oversText: '0.0',
+      },
+      officials: {
+        scorerIds: [scorerId],
+        scorerId,
+        activeScorerId: scorerId,
+      },
+      markModified: jest.fn(),
+      save: jest.fn().mockResolvedValue(true),
+    };
+
+    mockInningDoc = {
+      _id: new Types.ObjectId(),
+      matchId,
+      inningsNumber: 1,
+      battingTeamId: teamAId,
+      bowlingTeamId: teamBId,
+      totalRuns: 0,
+      totalWickets: 0,
+      legalBallsBowled: 0,
+      extras: { wides: 0, noBalls: 0, byes: 0, legByes: 0, penalty: 0 },
+      currentState: {},
+      battingCard: [],
+      bowlingCard: [],
+      fallOfWickets: [],
+      isCompleted: false,
+      markModified: jest.fn(),
+      save: jest.fn().mockResolvedValue(true),
+    };
+
     mockMatchModel.findById = jest.fn();
     mockInningModel.findOne = jest.fn();
     mockBallModel.find = jest.fn();
@@ -233,6 +249,39 @@ describe('ScoringService', () => {
       expect(mockInningDoc.totalRuns).toBe(4);
       expect(mockInningDoc.legalBallsBowled).toBe(1);
       expect(mockInningDoc.save).toHaveBeenCalled();
+    });
+
+    it('should reject new deliveries if innings is already completed', async () => {
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+      const completedInning = {
+        ...mockInningDoc,
+        isCompleted: true,
+        legalBallsBowled: 120,
+      };
+      mockInningModel.findOne = jest.fn().mockResolvedValue(completedInning);
+      mockBallModel.find = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue([]),
+      });
+
+      await expect(
+        service.syncBalls(matchId.toString(), scorerId.toString(), {
+          inningsNumber: 1,
+          events: [
+            {
+              clientEventId: 'evt-over-limit',
+              sequenceNumber: 121,
+              overNumber: 21,
+              legalBallInOver: 1,
+              bowlerId: bowler1Id.toString(),
+              strikerId: batter1Id.toString(),
+              nonStrikerId: batter2Id.toString(),
+              runsOffBat: 1,
+              isLegalDelivery: true,
+              recordedAt: '2026-11-20T11:00:00Z',
+            },
+          ],
+        }),
+      ).rejects.toThrow(BadRequestException);
     });
   });
 
@@ -464,6 +513,197 @@ describe('ScoringService', () => {
       expect(result[1].overNumber).toBe(2);
       expect(result[1].legalBalls).toBe(0);
       expect(result[1].runsInOver).toBe(1);
+    });
+  });
+
+  describe('updateInningsState', () => {
+    it('should update strike and bowler and seed cards for authorized scorer', async () => {
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+      const testInning = {
+        ...mockInningDoc,
+        currentState: { currentOverNumber: 1 },
+        battingCard: [],
+        bowlingCard: [],
+        markModified: jest.fn(),
+        save: jest.fn().mockResolvedValue(true),
+      };
+      mockInningModel.findOne = jest.fn().mockResolvedValue(testInning);
+
+      const result = await service.updateInningsState(
+        matchId.toString(),
+        1,
+        scorerId.toString(),
+        {
+          strikerId: batter1Id.toString(),
+          nonStrikerId: batter2Id.toString(),
+          currentBowlerId: bowler1Id.toString(),
+        },
+      );
+
+      expect(result.inning.currentState.strikerId.toString()).toBe(
+        batter1Id.toString(),
+      );
+      expect(result.inning.currentState.nonStrikerId.toString()).toBe(
+        batter2Id.toString(),
+      );
+      expect(result.inning.currentState.currentBowlerId.toString()).toBe(
+        bowler1Id.toString(),
+      );
+      expect(result.inning.battingCard.length).toBe(2);
+      expect(result.inning.bowlingCard.length).toBe(1);
+      expect(testInning.save).toHaveBeenCalled();
+    });
+
+    it('should throw ForbiddenException if user is not authorized scorer', async () => {
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+      const unauthorizedId = new Types.ObjectId('672000000000000000000999');
+
+      await expect(
+        service.updateInningsState(
+          matchId.toString(),
+          1,
+          unauthorizedId.toString(),
+          {
+            strikerId: batter1Id.toString(),
+          },
+        ),
+      ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('recomputeInningsState with 0 balls', () => {
+    it('should preserve openers in currentState and seed cards when activeBalls is empty', async () => {
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+      const testInning = {
+        ...mockInningDoc,
+        currentState: {
+          strikerId: batter1Id,
+          nonStrikerId: batter2Id,
+          currentBowlerId: bowler1Id,
+          currentOverNumber: 1,
+        },
+        battingCard: [],
+        bowlingCard: [],
+        markModified: jest.fn(),
+        save: jest.fn().mockResolvedValue(true),
+      };
+      mockInningModel.findOne = jest.fn().mockResolvedValue(testInning);
+      mockBallModel.find = jest.fn().mockReturnValue({
+        sort: jest.fn().mockReturnValue({
+          lean: jest.fn().mockResolvedValue([]), // 0 active balls
+        }),
+      });
+
+      const result = await service.recomputeInningsState(matchId, 1);
+
+      expect(result).not.toBeNull();
+      expect(result!.inning.currentState.strikerId).toBe(batter1Id);
+      expect(result!.inning.currentState.nonStrikerId).toBe(batter2Id);
+      expect(result!.inning.currentState.currentBowlerId).toBe(bowler1Id);
+      expect(result!.inning.battingCard.length).toBe(2);
+      expect(result!.inning.bowlingCard.length).toBe(1);
+    });
+
+    it('should mark Innings 1 isCompleted = true and status INNINGS_BREAK when legal balls reach quota', async () => {
+      const matchDoc = {
+        ...mockMatchDoc,
+        oversPerInnings: 1,
+        ballsPerOver: 6,
+        status: MatchStatus.LIVE,
+      };
+      mockMatchModel.findById = jest.fn().mockResolvedValue(matchDoc);
+
+      const testInning = {
+        ...mockInningDoc,
+        inningsNumber: 1,
+        isCompleted: false,
+        markModified: jest.fn(),
+        save: jest.fn().mockResolvedValue(true),
+      };
+      mockInningModel.findOne = jest.fn().mockResolvedValue(testInning);
+
+      const sixBalls = Array.from({ length: 6 }, (_, i) => ({
+        sequenceNumber: i + 1,
+        overNumber: 1,
+        legalBallInOver: i + 1,
+        strikerId: batter1Id,
+        nonStrikerId: batter2Id,
+        bowlerId: bowler1Id,
+        runsOffBat: 1,
+        extraType: ExtraType.NONE,
+        extraRuns: 0,
+        isLegalDelivery: true,
+      }));
+
+      mockBallModel.find = jest.fn().mockReturnValue({
+        sort: jest.fn().mockReturnValue({
+          lean: jest.fn().mockResolvedValue(sixBalls),
+        }),
+      });
+
+      const result = await service.recomputeInningsState(matchId, 1);
+      expect(result!.inning.isCompleted).toBe(true);
+      expect(result!.match.status).toBe(MatchStatus.INNINGS_BREAK);
+    });
+
+    it('should mark Innings 2 isCompleted = true when target runs is reached', async () => {
+      const matchDoc = {
+        ...mockMatchDoc,
+        oversPerInnings: 20,
+        ballsPerOver: 6,
+        currentInningsNumber: 2,
+        status: MatchStatus.LIVE,
+      };
+      mockMatchModel.findById = jest.fn().mockResolvedValue(matchDoc);
+
+      const testInning = {
+        ...mockInningDoc,
+        inningsNumber: 2,
+        targetRuns: 10,
+        isCompleted: false,
+        markModified: jest.fn(),
+        save: jest.fn().mockResolvedValue(true),
+      };
+      mockInningModel.findOne = jest.fn().mockResolvedValue(testInning);
+
+      const balls = [
+        {
+          sequenceNumber: 1,
+          overNumber: 1,
+          legalBallInOver: 1,
+          strikerId: batter1Id,
+          nonStrikerId: batter2Id,
+          bowlerId: bowler1Id,
+          runsOffBat: 6,
+          isBoundarySix: true,
+          extraType: ExtraType.NONE,
+          extraRuns: 0,
+          isLegalDelivery: true,
+        },
+        {
+          sequenceNumber: 2,
+          overNumber: 1,
+          legalBallInOver: 2,
+          strikerId: batter1Id,
+          nonStrikerId: batter2Id,
+          bowlerId: bowler1Id,
+          runsOffBat: 6,
+          isBoundarySix: true,
+          extraType: ExtraType.NONE,
+          extraRuns: 0,
+          isLegalDelivery: true,
+        },
+      ];
+
+      mockBallModel.find = jest.fn().mockReturnValue({
+        sort: jest.fn().mockReturnValue({
+          lean: jest.fn().mockResolvedValue(balls),
+        }),
+      });
+
+      const result = await service.recomputeInningsState(matchId, 2);
+      expect(result!.inning.isCompleted).toBe(true);
+      expect(result!.inning.totalRuns).toBe(12);
     });
   });
 });

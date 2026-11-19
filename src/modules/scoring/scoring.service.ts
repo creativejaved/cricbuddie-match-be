@@ -7,12 +7,17 @@ import {
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
-import { Match, MatchDocument } from '../../schemas/match.schema';
+import {
+  Match,
+  MatchDocument,
+  MatchStatus,
+} from '../../schemas/match.schema';
 import {
   BatterLine,
   BowlerLine,
   FallOfWicket,
   Inning,
+  InningCurrentState,
   InningDocument,
 } from '../../schemas/inning.schema';
 import {
@@ -23,6 +28,7 @@ import {
 } from '../../schemas/ball.schema';
 import { SyncBallsDto } from './dto/sync-balls.dto';
 import { UndoBallsDto } from './dto/undo-balls.dto';
+import { UpdateInningsStateDto } from './dto/update-innings-state.dto';
 
 @Injectable()
 export class ScoringService {
@@ -95,6 +101,39 @@ export class ScoringService {
       (e) => !existingIdSet.has(e.clientEventId),
     );
     const duplicateCount = dto.events.length - newEvents.length;
+
+    // Check if innings is completed before inserting new events
+    if (newEvents.length > 0) {
+      const inning = await this.inningModel.findOne({
+        matchId: match._id,
+        inningsNumber: dto.inningsNumber,
+      });
+      if (!inning) {
+        throw new NotFoundException(
+          `Innings ${dto.inningsNumber} not found for this match`,
+        );
+      }
+
+      const ballsPerOver = match.ballsPerOver || 6;
+      const oversPerInnings = match.oversPerInnings || 20;
+      const maxLegalBalls = oversPerInnings * ballsPerOver;
+      const isTeamABatting = match.teamA.teamId.equals(inning.battingTeamId);
+      const battingSlot = isTeamABatting ? match.teamA : match.teamB;
+      const maxWickets = Math.max(1, (battingSlot.playingXI?.length || 11) - 1);
+
+      if (
+        inning.isCompleted ||
+        inning.legalBallsBowled >= maxLegalBalls ||
+        inning.totalWickets >= maxWickets ||
+        (inning.inningsNumber === 2 &&
+          inning.targetRuns &&
+          inning.totalRuns >= inning.targetRuns)
+      ) {
+        throw new BadRequestException(
+          'Innings is already completed. No further deliveries can be recorded.',
+        );
+      }
+    }
 
     // 2. Insert new events
     if (newEvents.length > 0) {
@@ -280,7 +319,171 @@ export class ScoringService {
   }
 
   /**
-   * 4. Deterministic Recompute Engine
+   * 4. Update live innings state (striker, non-striker, bowler, strike swaps)
+   */
+  async updateInningsState(
+    matchId: string,
+    inningsNumber: number,
+    userId: string,
+    dto: UpdateInningsStateDto,
+  ) {
+    if (!Types.ObjectId.isValid(matchId)) {
+      throw new BadRequestException('Invalid match ID format');
+    }
+
+    const match = await this.matchModel.findById(matchId);
+    if (!match) {
+      throw new NotFoundException('Match not found');
+    }
+
+    if (!this.isAuthorizedScorer(match, userId)) {
+      throw new ForbiddenException(
+        'You do not have authorization to update innings state for this match',
+      );
+    }
+
+    const inning = await this.inningModel.findOne({
+      matchId: match._id,
+      inningsNumber,
+    });
+    if (!inning) {
+      throw new NotFoundException(
+        `Innings ${inningsNumber} not found for this match`,
+      );
+    }
+
+    const isTeamABatting = match.teamA.teamId.equals(inning.battingTeamId);
+    const battingSlot = isTeamABatting ? match.teamA : match.teamB;
+    const bowlingSlot = isTeamABatting ? match.teamB : match.teamA;
+
+    if (
+      dto.strikerId &&
+      dto.nonStrikerId &&
+      dto.strikerId === dto.nonStrikerId
+    ) {
+      throw new BadRequestException(
+        'Striker and non-striker must be distinct players',
+      );
+    }
+
+    if (!inning.currentState) {
+      inning.currentState = { currentOverNumber: 1 };
+    }
+    if (!inning.battingCard) {
+      inning.battingCard = [];
+    }
+    if (!inning.bowlingCard) {
+      inning.bowlingCard = [];
+    }
+
+    if (dto.strikerId) {
+      if (!Types.ObjectId.isValid(dto.strikerId)) {
+        throw new BadRequestException('Invalid striker ID format');
+      }
+      const player = (battingSlot.playingXI || []).find(
+        (p) => p.userId?.toString() === dto.strikerId,
+      );
+      if (!player) {
+        throw new BadRequestException(
+          'Striker must be an announced player in the batting team Playing XI',
+        );
+      }
+      const strikerObjectId = new Types.ObjectId(dto.strikerId);
+      inning.currentState.strikerId = strikerObjectId;
+
+      if (!inning.battingCard.some((b) => b.playerId.equals(strikerObjectId))) {
+        inning.battingCard.push({
+          playerId: strikerObjectId,
+          fullName: player.fullName,
+          username: player.username || null,
+          runs: 0,
+          ballsFaced: 0,
+          fours: 0,
+          sixes: 0,
+          isOut: false,
+          dismissalText: 'not out',
+          bowlerId: null,
+          fielderId: null,
+        });
+      }
+    }
+
+    if (dto.nonStrikerId) {
+      if (!Types.ObjectId.isValid(dto.nonStrikerId)) {
+        throw new BadRequestException('Invalid non-striker ID format');
+      }
+      const player = (battingSlot.playingXI || []).find(
+        (p) => p.userId?.toString() === dto.nonStrikerId,
+      );
+      if (!player) {
+        throw new BadRequestException(
+          'Non-striker must be an announced player in the batting team Playing XI',
+        );
+      }
+      const nonStrikerObjectId = new Types.ObjectId(dto.nonStrikerId);
+      inning.currentState.nonStrikerId = nonStrikerObjectId;
+
+      if (
+        !inning.battingCard.some((b) => b.playerId.equals(nonStrikerObjectId))
+      ) {
+        inning.battingCard.push({
+          playerId: nonStrikerObjectId,
+          fullName: player.fullName,
+          username: player.username || null,
+          runs: 0,
+          ballsFaced: 0,
+          fours: 0,
+          sixes: 0,
+          isOut: false,
+          dismissalText: 'not out',
+          bowlerId: null,
+          fielderId: null,
+        });
+      }
+    }
+
+    if (dto.currentBowlerId) {
+      if (!Types.ObjectId.isValid(dto.currentBowlerId)) {
+        throw new BadRequestException('Invalid bowler ID format');
+      }
+      const player = (bowlingSlot.playingXI || []).find(
+        (p) => p.userId?.toString() === dto.currentBowlerId,
+      );
+      if (!player) {
+        throw new BadRequestException(
+          'Bowler must be an announced player in the bowling team Playing XI',
+        );
+      }
+      const bowlerObjectId = new Types.ObjectId(dto.currentBowlerId);
+      inning.currentState.currentBowlerId = bowlerObjectId;
+
+      if (!inning.bowlingCard.some((b) => b.playerId.equals(bowlerObjectId))) {
+        inning.bowlingCard.push({
+          playerId: bowlerObjectId,
+          fullName: player.fullName,
+          username: player.username || null,
+          legalBalls: 0,
+          maidens: 0,
+          runsConceded: 0,
+          wickets: 0,
+          wides: 0,
+          noBalls: 0,
+        });
+      }
+    }
+
+    if (typeof inning.markModified === 'function') {
+      inning.markModified('currentState');
+      inning.markModified('battingCard');
+      inning.markModified('bowlingCard');
+    }
+    await inning.save();
+
+    return { match, inning };
+  }
+
+  /**
+   * 5. Deterministic Recompute Engine
    * Replays all active deliveries for (matchId, inningsNumber) to reconstruct:
    * - Inning totals, wickets, legal balls, extras breakdown
    * - Batting card (runs, balls faced, boundaries, dismissals)
@@ -568,12 +771,62 @@ export class ScoringService {
 
     // Current State
     const latestBall = activeBalls[activeBalls.length - 1];
-    const currentState = {
-      strikerId: latestBall ? latestBall.strikerId : null,
-      nonStrikerId: latestBall ? latestBall.nonStrikerId : null,
-      currentBowlerId: latestBall ? latestBall.bowlerId : null,
-      currentOverNumber: Math.floor(legalBallsBowled / ballsPerOver) + 1,
-    };
+    let currentState: InningCurrentState;
+
+    if (activeBalls.length === 0) {
+      // Preserve initialized openers & opening bowler when 0 deliveries
+      currentState = {
+        strikerId: inning.currentState?.strikerId || null,
+        nonStrikerId: inning.currentState?.nonStrikerId || null,
+        currentBowlerId: inning.currentState?.currentBowlerId || null,
+        currentOverNumber: 1,
+      };
+      if (currentState.strikerId) {
+        getOrCreateBatter(currentState.strikerId);
+      }
+      if (currentState.nonStrikerId) {
+        getOrCreateBatter(currentState.nonStrikerId);
+      }
+      if (currentState.currentBowlerId) {
+        getOrCreateBowler(currentState.currentBowlerId);
+      }
+    } else {
+      currentState = {
+        strikerId: latestBall ? latestBall.strikerId : null,
+        nonStrikerId: latestBall ? latestBall.nonStrikerId : null,
+        currentBowlerId: latestBall ? latestBall.bowlerId : null,
+        currentOverNumber: Math.floor(legalBallsBowled / ballsPerOver) + 1,
+      };
+    }
+
+    // Completion checks
+    const oversPerInnings = match.oversPerInnings || 20;
+    const maxLegalBalls = oversPerInnings * ballsPerOver;
+    const isTeamABatting = match.teamA.teamId.equals(inning.battingTeamId);
+    const battingSlot = isTeamABatting ? match.teamA : match.teamB;
+    const maxWickets = Math.max(1, (battingSlot.playingXI?.length || 11) - 1);
+
+    const isOversCompleted = legalBallsBowled >= maxLegalBalls;
+    const isAllOut = totalWickets >= maxWickets;
+    const isTargetChased = Boolean(
+      inning.inningsNumber === 2 &&
+        inning.targetRuns &&
+        totalRuns >= inning.targetRuns,
+    );
+
+    if (isOversCompleted || isAllOut || isTargetChased) {
+      inning.isCompleted = true;
+      if (inning.inningsNumber === 1 && match.currentInningsNumber === 1) {
+        match.status = MatchStatus.INNINGS_BREAK;
+      }
+    } else {
+      if (inning.isCompleted) {
+        inning.isCompleted = false;
+        if (inning.inningsNumber === 1 && match.currentInningsNumber === 1) {
+          match.status = MatchStatus.LIVE;
+        }
+      }
+    }
 
     // Save Inning
     inning.totalRuns = totalRuns;
@@ -587,9 +840,6 @@ export class ScoringService {
     await inning.save();
 
     // Sync summary score into Match document
-    const isTeamABatting = match.teamA.teamId.equals(inning.battingTeamId);
-    const battingSlot = isTeamABatting ? match.teamA : match.teamB;
-
     battingSlot.runs = totalRuns;
     battingSlot.wickets = totalWickets;
     battingSlot.oversText = this.formatOvers(legalBallsBowled, ballsPerOver);

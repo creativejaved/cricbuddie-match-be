@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   ArrayMaxSize,
   IsArray,
+  IsBoolean,
   IsDateString,
   IsEnum,
   IsInt,
@@ -178,13 +179,24 @@ export class CreateMatchDto {
   @Type(() => MatchVenueDto)
   venue: MatchVenueDto;
 
-  @ApiProperty({
-    example: '2026-11-20T10:00:00.000Z',
-    description: 'Scheduled match kickoff time',
+  @ApiPropertyOptional({
+    example: false,
+    default: false,
+    description:
+      'If true, starts the match immediately (defaults scheduledAt to now)',
   })
+  @IsOptional()
+  @IsBoolean()
+  startNow?: boolean;
+
+  @ApiPropertyOptional({
+    example: '2026-11-20T10:00:00.000Z',
+    description:
+      'Scheduled match kickoff time (defaults to current time if omitted or startNow is true)',
+  })
+  @IsOptional()
   @IsDateString()
-  @IsNotEmpty()
-  scheduledAt: string;
+  scheduledAt?: string;
 
   @ApiPropertyOptional({
     type: MatchOfficialsDto,

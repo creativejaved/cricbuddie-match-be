@@ -29,6 +29,9 @@ import { SetPlayingXIDto } from './dto/set-playing-xi.dto';
 import { RecordTossDto } from './dto/record-toss.dto';
 import { CompleteMatchDto } from './dto/complete-match.dto';
 import { UpdateMatchOfficialsDto } from './dto/update-match-officials.dto';
+import { AssignScorerDto } from './dto/assign-scorer.dto';
+import { StartMatchDto } from './dto/start-match.dto';
+import { StartNextInningsDto } from './dto/start-next-innings.dto';
 
 @Injectable()
 export class MatchesService {
@@ -164,7 +167,9 @@ export class MatchesService {
         groundName: venueGround,
         city: dto.venue.city,
       },
-      scheduledAt: new Date(dto.scheduledAt),
+      scheduledAt: dto.scheduledAt
+        ? new Date(dto.scheduledAt)
+        : new Date(),
       status: MatchStatus.SCHEDULED,
       createdBy: creatorObjectId,
       teamA: {
@@ -212,16 +217,11 @@ export class MatchesService {
    */
   async getMatches(query: QueryMatchesDto, currentUserId?: string) {
     const filter: Record<string, any> = {};
+    const andConditions: any[] = [];
 
     if (query.status) {
       filter.status = query.status;
-    }
-
-    if (query.matchType) {
-      filter.$or = [
-        { matchType: query.matchType },
-        { matchFormat: query.matchType },
-      ];
+      andConditions.push({ status: query.status });
     }
 
     if (query.pitchType) {
@@ -232,29 +232,51 @@ export class MatchesService {
       filter['venue.city'] = new RegExp(query.city.trim(), 'i');
     }
 
-    if (query.teamId && Types.ObjectId.isValid(query.teamId)) {
-      const teamObjectId = new Types.ObjectId(query.teamId);
-      filter.$or = [
-        { 'teamA.teamId': teamObjectId },
-        { 'teamB.teamId': teamObjectId },
-      ];
+    if (query.matchType) {
+      andConditions.push({
+        $or: [
+          { matchType: query.matchType },
+          { matchFormat: query.matchType },
+        ],
+      });
     }
 
-    if (query.myMatches) {
-      if (!currentUserId) {
+    if (query.teamId && Types.ObjectId.isValid(query.teamId)) {
+      const teamObjectId = new Types.ObjectId(query.teamId);
+      andConditions.push({
+        $or: [
+          { 'teamA.teamId': teamObjectId },
+          { 'teamB.teamId': teamObjectId },
+        ],
+      });
+    }
+
+    const targetUserId =
+      query.userId || (query.myMatches ? currentUserId : null);
+    if (targetUserId) {
+      if (query.myMatches && !currentUserId) {
         throw new ForbiddenException(
           'Authentication required to filter personal matches',
         );
       }
-      const userObjectId = new Types.ObjectId(currentUserId);
-      filter.$or = [
-        { createdBy: userObjectId },
-        { 'officials.scorerId': userObjectId },
-        { 'officials.activeScorerId': userObjectId },
-        { 'officials.umpireIds': userObjectId },
-        { 'teamA.playingXI.userId': userObjectId },
-        { 'teamB.playingXI.userId': userObjectId },
-      ];
+      if (Types.ObjectId.isValid(targetUserId)) {
+        const userObjectId = new Types.ObjectId(targetUserId);
+        andConditions.push({
+          $or: [
+            { createdBy: userObjectId },
+            { 'officials.scorerIds': userObjectId },
+            { 'officials.scorerId': userObjectId },
+            { 'officials.activeScorerId': userObjectId },
+            { 'officials.umpireIds': userObjectId },
+            { 'teamA.playingXI.userId': userObjectId },
+            { 'teamB.playingXI.userId': userObjectId },
+          ],
+        });
+      }
+    }
+
+    if (andConditions.length > 0) {
+      filter.$and = andConditions;
     }
 
     const page = query.page && query.page > 0 ? query.page : 1;
@@ -277,6 +299,13 @@ export class MatchesService {
       page,
       limit,
     };
+  }
+
+  /**
+   * Alias for getMatches to support findAll query conventions
+   */
+  async findAll(query: QueryMatchesDto, currentUserId?: string) {
+    return this.getMatches(query, currentUserId);
   }
 
   /**
@@ -435,6 +464,365 @@ export class MatchesService {
   }
 
   /**
+   * Helper to initialize openers, bowler, and active scorer on an Inning and Match
+   */
+  private applyOpenersAndBowler(
+    match: MatchDocument,
+    inning: InningDocument,
+    dto: {
+      strikerId?: string;
+      nonStrikerId?: string;
+      bowlerId?: string;
+      scorerUserId?: string;
+    },
+  ) {
+    if (dto.scorerUserId && Types.ObjectId.isValid(dto.scorerUserId)) {
+      const sId = new Types.ObjectId(dto.scorerUserId);
+      if (!match.officials) {
+        match.officials = {
+          scorerIds: [],
+          scorerId: null,
+          activeScorerId: null,
+          umpireIds: [],
+          matchRefereeId: null,
+          liveStreamerIds: [],
+          streamerId: null,
+          commentatorIds: [],
+        };
+      }
+      match.officials.activeScorerId = sId;
+      match.officials.scorerId = sId;
+      if (!match.officials.scorerIds.some((id) => id.equals(sId))) {
+        if (match.officials.scorerIds.length >= 2) {
+          match.officials.scorerIds[1] = sId;
+        } else {
+          match.officials.scorerIds.push(sId);
+        }
+      }
+      match.markModified('officials');
+    }
+
+    const isTeamABatting = match.teamA.teamId.equals(inning.battingTeamId);
+    const battingSlot = isTeamABatting ? match.teamA : match.teamB;
+    const bowlingSlot = isTeamABatting ? match.teamB : match.teamA;
+
+    if (
+      dto.strikerId &&
+      dto.nonStrikerId &&
+      dto.strikerId === dto.nonStrikerId
+    ) {
+      throw new BadRequestException(
+        'Striker and non-striker must be distinct players',
+      );
+    }
+
+    if (!inning.currentState) {
+      inning.currentState = { currentOverNumber: 1 };
+    }
+    if (!inning.battingCard) {
+      inning.battingCard = [];
+    }
+    if (!inning.bowlingCard) {
+      inning.bowlingCard = [];
+    }
+
+    if (dto.strikerId) {
+      if (!Types.ObjectId.isValid(dto.strikerId)) {
+        throw new BadRequestException('Invalid striker ID format');
+      }
+      const player = (battingSlot.playingXI || []).find(
+        (p) => p.userId?.toString() === dto.strikerId,
+      );
+      if (!player) {
+        throw new BadRequestException(
+          'Striker must be an announced player in the batting team Playing XI',
+        );
+      }
+      const strikerObjectId = new Types.ObjectId(dto.strikerId);
+      inning.currentState.strikerId = strikerObjectId;
+
+      if (!inning.battingCard.some((b) => b.playerId.equals(strikerObjectId))) {
+        inning.battingCard.push({
+          playerId: strikerObjectId,
+          fullName: player.fullName,
+          username: player.username || null,
+          runs: 0,
+          ballsFaced: 0,
+          fours: 0,
+          sixes: 0,
+          isOut: false,
+          dismissalText: 'not out',
+          bowlerId: null,
+          fielderId: null,
+        });
+      }
+    }
+
+    if (dto.nonStrikerId) {
+      if (!Types.ObjectId.isValid(dto.nonStrikerId)) {
+        throw new BadRequestException('Invalid non-striker ID format');
+      }
+      const player = (battingSlot.playingXI || []).find(
+        (p) => p.userId?.toString() === dto.nonStrikerId,
+      );
+      if (!player) {
+        throw new BadRequestException(
+          'Non-striker must be an announced player in the batting team Playing XI',
+        );
+      }
+      const nonStrikerObjectId = new Types.ObjectId(dto.nonStrikerId);
+      inning.currentState.nonStrikerId = nonStrikerObjectId;
+
+      if (
+        !inning.battingCard.some((b) => b.playerId.equals(nonStrikerObjectId))
+      ) {
+        inning.battingCard.push({
+          playerId: nonStrikerObjectId,
+          fullName: player.fullName,
+          username: player.username || null,
+          runs: 0,
+          ballsFaced: 0,
+          fours: 0,
+          sixes: 0,
+          isOut: false,
+          dismissalText: 'not out',
+          bowlerId: null,
+          fielderId: null,
+        });
+      }
+    }
+
+    if (dto.bowlerId) {
+      if (!Types.ObjectId.isValid(dto.bowlerId)) {
+        throw new BadRequestException('Invalid bowler ID format');
+      }
+      const player = (bowlingSlot.playingXI || []).find(
+        (p) => p.userId?.toString() === dto.bowlerId,
+      );
+      if (!player) {
+        throw new BadRequestException(
+          'Opening bowler must be an announced player in the bowling team Playing XI',
+        );
+      }
+      const bowlerObjectId = new Types.ObjectId(dto.bowlerId);
+      inning.currentState.currentBowlerId = bowlerObjectId;
+
+      if (!inning.bowlingCard.some((b) => b.playerId.equals(bowlerObjectId))) {
+        inning.bowlingCard.push({
+          playerId: bowlerObjectId,
+          fullName: player.fullName,
+          username: player.username || null,
+          legalBalls: 0,
+          maidens: 0,
+          runsConceded: 0,
+          wickets: 0,
+          wides: 0,
+          noBalls: 0,
+        });
+      }
+    }
+
+    if (typeof inning.markModified === 'function') {
+      inning.markModified('currentState');
+      inning.markModified('battingCard');
+      inning.markModified('bowlingCard');
+    }
+  }
+
+  /**
+   * Reassign or set active match scorer
+   */
+  async assignScorer(
+    matchId: string,
+    requesterId: string,
+    dto: AssignScorerDto,
+  ) {
+    if (
+      !Types.ObjectId.isValid(matchId) ||
+      !Types.ObjectId.isValid(dto.scorerUserId)
+    ) {
+      throw new BadRequestException('Invalid ID format');
+    }
+
+    const match = await this.matchModel.findById(matchId);
+    if (!match) {
+      throw new NotFoundException('Match not found');
+    }
+
+    const isScorerOrCreator = this.isMatchScorerOrCreator(match, requesterId);
+    let isTeamAdmin = false;
+
+    if (!isScorerOrCreator) {
+      const [teamA, teamB] = await Promise.all([
+        this.teamModel.findById(match.teamA.teamId).lean(),
+        this.teamModel.findById(match.teamB.teamId).lean(),
+      ]);
+      const isTeamAAdmin =
+        teamA?.ownerId.toString() === requesterId ||
+        teamA?.adminIds?.some((id) => id.toString() === requesterId);
+      const isTeamBAdmin =
+        teamB?.ownerId.toString() === requesterId ||
+        teamB?.adminIds?.some((id) => id.toString() === requesterId);
+      isTeamAdmin = Boolean(isTeamAAdmin || isTeamBAdmin);
+    }
+
+    if (!isScorerOrCreator && !isTeamAdmin) {
+      throw new ForbiddenException(
+        'Only match officials, creator, or team administrators can assign scorers',
+      );
+    }
+
+    if (!match.officials) {
+      match.officials = {
+        scorerIds: [],
+        scorerId: null,
+        activeScorerId: null,
+        umpireIds: [],
+        matchRefereeId: null,
+        liveStreamerIds: [],
+        streamerId: null,
+        commentatorIds: [],
+      };
+    }
+
+    const scorerObjectId = new Types.ObjectId(dto.scorerUserId);
+    match.officials.activeScorerId = scorerObjectId;
+    match.officials.scorerId = scorerObjectId;
+
+    if (!match.officials.scorerIds.some((id) => id.equals(scorerObjectId))) {
+      if (match.officials.scorerIds.length >= 2) {
+        match.officials.scorerIds[1] = scorerObjectId;
+      } else {
+        match.officials.scorerIds.push(scorerObjectId);
+      }
+    }
+
+    match.markModified('officials');
+    await match.save();
+    return match;
+  }
+
+  /**
+   * Explicitly start a match and initialize Inning #1 with openers & opening bowler
+   */
+  async startMatch(matchId: string, userId: string, dto: StartMatchDto) {
+    if (!Types.ObjectId.isValid(matchId)) {
+      throw new BadRequestException('Invalid match ID format');
+    }
+
+    const match = await this.matchModel.findById(matchId);
+    if (!match) {
+      throw new NotFoundException('Match not found');
+    }
+
+    if (!this.isMatchScorerOrCreator(match, userId)) {
+      throw new ForbiddenException(
+        'Only match officials or creator can start the match',
+      );
+    }
+
+    if (
+      match.status === MatchStatus.COMPLETED ||
+      match.status === MatchStatus.ABANDONED
+    ) {
+      throw new BadRequestException(
+        `Cannot start match when status is ${match.status}`,
+      );
+    }
+
+    // Both teams must announce Playing XI before starting
+    if (
+      !match.teamA?.playingXI?.length ||
+      match.teamA.playingXI.length < 2 ||
+      !match.teamB?.playingXI?.length ||
+      match.teamB.playingXI.length < 2
+    ) {
+      throw new BadRequestException(
+        'Both teams must announce Playing XI before starting the match',
+      );
+    }
+
+    // Handle toss if provided or already recorded
+    if (dto.wonByTeamId && dto.decision) {
+      const wonByTeamId = new Types.ObjectId(dto.wonByTeamId);
+      const isTeamA = match.teamA.teamId.equals(wonByTeamId);
+      const isTeamB = match.teamB.teamId.equals(wonByTeamId);
+      if (!isTeamA && !isTeamB) {
+        throw new BadRequestException('Toss winner must be teamA or teamB');
+      }
+      match.toss = {
+        wonByTeamId,
+        decision: dto.decision,
+      };
+    } else if (!match.toss?.wonByTeamId || !match.toss?.decision) {
+      throw new BadRequestException(
+        'Toss must be recorded before starting the match',
+      );
+    }
+
+    const wonByTeamId = match.toss.wonByTeamId;
+    const isTeamA = match.teamA.teamId.equals(wonByTeamId);
+    let battingTeamId: Types.ObjectId;
+    let bowlingTeamId: Types.ObjectId;
+
+    if (isTeamA) {
+      if (match.toss.decision === TossDecision.BAT) {
+        battingTeamId = match.teamA.teamId;
+        bowlingTeamId = match.teamB.teamId;
+      } else {
+        battingTeamId = match.teamB.teamId;
+        bowlingTeamId = match.teamA.teamId;
+      }
+    } else {
+      if (match.toss.decision === TossDecision.BAT) {
+        battingTeamId = match.teamB.teamId;
+        bowlingTeamId = match.teamA.teamId;
+      } else {
+        battingTeamId = match.teamA.teamId;
+        bowlingTeamId = match.teamB.teamId;
+      }
+    }
+
+    match.status = MatchStatus.LIVE;
+    match.currentInningsNumber = 1;
+
+    let inning1 = await this.inningModel.findOne({
+      matchId: match._id,
+      inningsNumber: 1,
+    });
+
+    if (!inning1) {
+      inning1 = new this.inningModel({
+        matchId: match._id,
+        inningsNumber: 1,
+        battingTeamId,
+        bowlingTeamId,
+        isCompleted: false,
+        totalRuns: 0,
+        totalWickets: 0,
+        legalBallsBowled: 0,
+        extras: { wides: 0, noBalls: 0, byes: 0, legByes: 0, penalty: 0 },
+        currentState: { currentOverNumber: 1 },
+        battingCard: [],
+        bowlingCard: [],
+        fallOfWickets: [],
+      });
+    } else {
+      inning1.battingTeamId = battingTeamId;
+      inning1.bowlingTeamId = bowlingTeamId;
+    }
+
+    this.applyOpenersAndBowler(match, inning1, dto);
+
+    await Promise.all([match.save(), inning1.save()]);
+
+    return {
+      match,
+      inning: inning1,
+    };
+  }
+
+  /**
    * 5. Record Toss and initialize Innings #1
    */
   async recordToss(matchId: string, userId: string, dto: RecordTossDto) {
@@ -512,7 +900,6 @@ export class MatchesService {
     };
     match.status = MatchStatus.LIVE;
     match.currentInningsNumber = 1;
-    await match.save();
 
     let inning1 = await this.inningModel.findOne({
       matchId: match._id,
@@ -535,8 +922,14 @@ export class MatchesService {
         bowlingCard: [],
         fallOfWickets: [],
       });
-      await inning1.save();
+    } else {
+      inning1.battingTeamId = battingTeamId;
+      inning1.bowlingTeamId = bowlingTeamId;
     }
+
+    this.applyOpenersAndBowler(match, inning1, dto);
+
+    await Promise.all([match.save(), inning1.save()]);
 
     return {
       match,
@@ -547,7 +940,11 @@ export class MatchesService {
   /**
    * 6. Transition to Next Innings (Innings 1 -> Innings 2)
    */
-  async nextInnings(matchId: string, userId: string) {
+  async nextInnings(
+    matchId: string,
+    userId: string,
+    dto?: StartNextInningsDto,
+  ) {
     if (!Types.ObjectId.isValid(matchId)) {
       throw new BadRequestException('Invalid match ID format');
     }
@@ -603,8 +1000,17 @@ export class MatchesService {
         bowlingCard: [],
         fallOfWickets: [],
       });
-      await inning2.save();
+    } else {
+      inning2.battingTeamId = inning1.bowlingTeamId;
+      inning2.bowlingTeamId = inning1.battingTeamId;
+      inning2.targetRuns = targetRuns;
     }
+
+    if (dto) {
+      this.applyOpenersAndBowler(match, inning2, dto);
+    }
+
+    await inning2.save();
 
     match.currentInningsNumber = 2;
     match.status = MatchStatus.LIVE;

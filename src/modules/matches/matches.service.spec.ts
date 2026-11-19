@@ -387,6 +387,60 @@ describe('MatchesService', () => {
       expect(result.inning.battingTeamId).toBe(teamBId);
       expect(result.inning.bowlingTeamId).toBe(teamAId);
     });
+
+    it('should initialize Inning 2 with openers and opening bowler when dto is provided', async () => {
+      mockMatchDoc.currentInningsNumber = 1;
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+
+      const inning1Doc = {
+        _id: new Types.ObjectId(),
+        inningsNumber: 1,
+        totalRuns: 160,
+        battingTeamId: teamAId,
+        bowlingTeamId: teamBId,
+        isCompleted: false,
+        save: jest.fn().mockResolvedValue(true),
+      };
+
+      mockInningModel.findOne = jest
+        .fn()
+        .mockResolvedValueOnce(inning1Doc)
+        .mockResolvedValueOnce(null);
+
+      const inning2SaveMock = jest.fn().mockResolvedValue(true);
+      mockInningModel.mockImplementation((dto) => ({
+        ...dto,
+        save: inning2SaveMock,
+      }));
+
+      const dhoniId = new Types.ObjectId('672000000000000000000201');
+      const rainaId = new Types.ObjectId('672000000000000000000202');
+
+      const result = await service.nextInnings(
+        matchId.toString(),
+        creatorId.toString(),
+        {
+          strikerId: dhoniId.toString(),
+          nonStrikerId: rainaId.toString(),
+          bowlerId: player1Id.toString(),
+        },
+      );
+
+      expect(inning1Doc.isCompleted).toBe(true);
+      expect(result.match.status).toBe(MatchStatus.LIVE);
+      expect(result.match.currentInningsNumber).toBe(2);
+      expect(result.inning.currentState.strikerId.toString()).toBe(
+        dhoniId.toString(),
+      );
+      expect(result.inning.currentState.nonStrikerId.toString()).toBe(
+        rainaId.toString(),
+      );
+      expect(result.inning.currentState.currentBowlerId.toString()).toBe(
+        player1Id.toString(),
+      );
+      expect(result.inning.battingCard.length).toBe(2);
+      expect(result.inning.bowlingCard.length).toBe(1);
+    });
   });
 
   describe('completeMatch', () => {
@@ -476,6 +530,152 @@ describe('MatchesService', () => {
           },
         ),
       ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('assignScorer', () => {
+    it('should assign a new active scorer and add to scorerIds when requested by creator', async () => {
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+      const newScorerId = new Types.ObjectId('672000000000000000000888');
+
+      const result = await service.assignScorer(
+        matchId.toString(),
+        creatorId.toString(),
+        {
+          scorerUserId: newScorerId.toString(),
+        },
+      );
+
+      expect(result.officials.activeScorerId.toString()).toBe(
+        newScorerId.toString(),
+      );
+      expect(result.officials.scorerId.toString()).toBe(newScorerId.toString());
+      expect(
+        result.officials.scorerIds.some(
+          (id: any) => id.toString() === newScorerId.toString(),
+        ),
+      ).toBe(true);
+      expect(mockMatchDoc.save).toHaveBeenCalled();
+    });
+
+    it('should throw ForbiddenException if requester is not authorized', async () => {
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+      mockTeamModel.findById = jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue(null),
+      });
+      const unauthorizedUserId = new Types.ObjectId('672000000000000000000999');
+
+      await expect(
+        service.assignScorer(
+          matchId.toString(),
+          unauthorizedUserId.toString(),
+          {
+            scorerUserId: '672000000000000000000888',
+          },
+        ),
+      ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('startMatch', () => {
+    it('should start match and initialize Inning 1 with openers and bowler', async () => {
+      mockMatchDoc.toss = {
+        wonByTeamId: teamAId,
+        decision: TossDecision.BAT,
+      };
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+      mockInningModel.findOne = jest.fn().mockResolvedValue(null);
+
+      const inningSaveMock = jest.fn().mockResolvedValue(true);
+      mockInningModel.mockImplementation((dto) => ({
+        ...dto,
+        _id: new Types.ObjectId(),
+        save: inningSaveMock,
+      }));
+
+      const bowlerId = new Types.ObjectId('672000000000000000000201'); // Dhoni from teamB
+      const result = await service.startMatch(
+        matchId.toString(),
+        creatorId.toString(),
+        {
+          strikerId: player1Id.toString(),
+          nonStrikerId: player2Id.toString(),
+          bowlerId: bowlerId.toString(),
+        },
+      );
+
+      expect(result.match.status).toBe(MatchStatus.LIVE);
+      expect(result.inning.currentState.strikerId.toString()).toBe(
+        player1Id.toString(),
+      );
+      expect(result.inning.currentState.nonStrikerId.toString()).toBe(
+        player2Id.toString(),
+      );
+      expect(result.inning.currentState.currentBowlerId.toString()).toBe(
+        bowlerId.toString(),
+      );
+      expect(result.inning.battingCard.length).toBe(2);
+      expect(result.inning.bowlingCard.length).toBe(1);
+      expect(inningSaveMock).toHaveBeenCalled();
+    });
+
+    it('should reject if striker and non-striker are identical', async () => {
+      mockMatchDoc.toss = {
+        wonByTeamId: teamAId,
+        decision: TossDecision.BAT,
+      };
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+
+      await expect(
+        service.startMatch(matchId.toString(), creatorId.toString(), {
+          strikerId: player1Id.toString(),
+          nonStrikerId: player1Id.toString(),
+        }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should reject if toss is not recorded and not provided in start payload', async () => {
+      mockMatchDoc.toss = null;
+      mockMatchModel.findById = jest.fn().mockResolvedValue(mockMatchDoc);
+
+      await expect(
+        service.startMatch(matchId.toString(), creatorId.toString(), {}),
+      ).rejects.toThrow(BadRequestException);
+    });
+  });
+
+  describe('getMatches and findAll filters', () => {
+    it('should compose $and filter with status, city, teamId, and userId', async () => {
+      let capturedFilter: any = null;
+      mockMatchModel.find = jest.fn().mockImplementation((filter) => {
+        capturedFilter = filter;
+        return {
+          sort: jest.fn().mockReturnThis(),
+          skip: jest.fn().mockReturnThis(),
+          limit: jest.fn().mockReturnThis(),
+          lean: jest.fn().mockResolvedValue([mockMatchDoc]),
+        };
+      });
+      mockMatchModel.countDocuments = jest.fn().mockResolvedValue(1);
+
+      const targetUserId = new Types.ObjectId('672000000000000000000777');
+      const result = await service.findAll({
+        status: MatchStatus.LIVE,
+        city: 'Bengaluru',
+        teamId: teamAId.toString(),
+        userId: targetUserId.toString(),
+      });
+
+      expect(result.total).toBe(1);
+      expect(capturedFilter.status).toBe(MatchStatus.LIVE);
+      expect(capturedFilter['venue.city']).toBeDefined();
+      expect(capturedFilter.$and).toBeDefined();
+      expect(capturedFilter.$and.length).toBe(3); // status, teamId ($or), and userId ($or)
+      expect(
+        capturedFilter.$and.some(
+          (c: any) => c.status === MatchStatus.LIVE,
+        ),
+      ).toBe(true);
     });
   });
 });

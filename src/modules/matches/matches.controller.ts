@@ -22,6 +22,9 @@ import { SetPlayingXIDto } from './dto/set-playing-xi.dto';
 import { RecordTossDto } from './dto/record-toss.dto';
 import { CompleteMatchDto } from './dto/complete-match.dto';
 import { UpdateMatchOfficialsDto } from './dto/update-match-officials.dto';
+import { AssignScorerDto } from './dto/assign-scorer.dto';
+import { StartMatchDto } from './dto/start-match.dto';
+import { StartNextInningsDto } from './dto/start-next-innings.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../../common/guards/optional-jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -122,14 +125,16 @@ export class MatchesController {
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth('JWT-auth')
   @ApiOperation({
-    summary: 'Complete Innings 1, set target runs, and initialize Innings 2',
+    summary:
+      'Complete Innings 1, set target runs, and initialize Innings 2 with optional openers & opening bowler',
   })
   @ApiParam({ name: 'matchId', example: '672000000000000000000050' })
   nextInnings(
     @Param('matchId', ObjectIdValidationPipe) matchId: string,
     @CurrentUser('userId') userId: string,
+    @Body() dto?: StartNextInningsDto,
   ) {
-    return this.matchesService.nextInnings(matchId, userId);
+    return this.matchesService.nextInnings(matchId, userId, dto);
   }
 
   /**
@@ -168,5 +173,42 @@ export class MatchesController {
     @Body() dto: UpdateMatchOfficialsDto,
   ) {
     return this.matchesService.updateOfficials(matchId, userId, dto);
+  }
+
+  /**
+   * 9. Reassign or set active match scorer
+   */
+  @Patch(':matchId/scorer')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary: 'Reassign or set active match scorer',
+  })
+  @ApiParam({ name: 'matchId', example: '672000000000000000000050' })
+  assignScorer(
+    @Param('matchId', ObjectIdValidationPipe) matchId: string,
+    @CurrentUser('userId') userId: string,
+    @Body() dto: AssignScorerDto,
+  ) {
+    return this.matchesService.assignScorer(matchId, userId, dto);
+  }
+
+  /**
+   * 10. Start match explicitly and initialize Inning #1 with openers & opening bowler
+   */
+  @Patch(':matchId/start')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({
+    summary:
+      'Explicitly transition match to LIVE, record toss (if needed), and initialize openers and opening bowler',
+  })
+  @ApiParam({ name: 'matchId', example: '672000000000000000000050' })
+  startMatch(
+    @Param('matchId', ObjectIdValidationPipe) matchId: string,
+    @CurrentUser('userId') userId: string,
+    @Body() dto: StartMatchDto,
+  ) {
+    return this.matchesService.startMatch(matchId, userId, dto);
   }
 }
